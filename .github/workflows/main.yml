@@ -1,4 +1,4 @@
-name: Sync Karing Releases
+name: Sync Karing Latest Release
 
 on:
   schedule:
@@ -8,13 +8,44 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Sync Releases
-        uses: gacts/github-releases-sync@v1
-        with:
-          # 源仓库
-          from_repo: KaringX/karing
-          # 目标仓库（即你的仓库）
-          to_repo: ${{ github.repository }}
-          # 使用自动生成的 Token
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compare and Sync Latest Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: KaringX/karing
+        run: |
+          # 1. 获取原仓库最新的 Tag
+          UPSTREAM_TAG=$(gh release view --repo $UPSTREAM --json tagName --template '{{.tagName}}')
+          echo "Upstream latest tag: $UPSTREAM_TAG"
+
+          # 2. 获取自己仓库最新的 Tag (如果不曾有 Release，则设为空)
+          MY_TAG=$(gh release view --json tagName --template '{{.tagName}}' 2>/dev/null || echo "none")
+          echo "My latest tag: $MY_TAG"
+
+          # 3. 只有当原仓库版本与我不一致时才同步
+          if [ "$UPSTREAM_TAG" != "$MY_TAG" ]; then
+            echo "New version detected! Syncing $UPSTREAM_TAG..."
+            
+            # 清理旧文件并下载新附件
+            mkdir -p dist
+            rm -rf dist/*
+            gh release download $UPSTREAM_TAG --repo $UPSTREAM --dir dist
+            
+            # 获取原 Release 说明
+            gh release view $UPSTREAM_TAG --repo $UPSTREAM --json body --template '{{.body}}' > notes.md
+            
+            # 创建新 Release
+            gh release create $UPSTREAM_TAG ./dist/* \
+              --title "Karing $UPSTREAM_TAG" \
+              --notes-file notes.md \
+              --latest # 标记为最新版本
+            
+            echo "Successfully synced $UPSTREAM_TAG."
+          else
+            echo "Already up to date. (Current: $MY_TAG)"
+          fi

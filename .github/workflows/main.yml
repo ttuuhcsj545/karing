@@ -2,13 +2,18 @@ name: Sync Latest Release to Gitee
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天凌晨 2 点检查
-  workflow_dispatch:   # 允许手动触发
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取所有分支和 Tag
+
       - name: Sync to Gitee
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -20,44 +25,47 @@ jobs:
           TAG=$(gh release view --repo $UPSTREAM --json tagName --template '{{.tagName}}')
           echo "Upstream latest tag: $TAG"
 
-          # 2. 检查 Gitee 是否已经存在该版本 (通过返回状态码判断)
-          HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}")
+          # 2. 强制同步代码和 Tag 到 Gitee (解决“什么都没有”的关键)
+          # 这一步确保 Gitee 仓库里先有这个 Tag
+          git remote add gitee https://any-user:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git
+          git push gitee main:master --force # 把 GitHub 的 main 推给 Gitee 的 master
+          git fetch --tags https://github.com/${UPSTREAM}.git
+          git push gitee $TAG --force # 强行把这个 Tag 推给 Gitee
+
+          # 3. 下载原仓库附件
+          mkdir -p dist
+          gh release download $TAG --repo $UPSTREAM --dir dist
           
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "Gitee already has version $TAG. Skipping."
-          else
-            echo "New version $TAG not found on Gitee. Starting migration..."
-
-            # 3. 下载原仓库附件
-            mkdir -p dist
-            gh release download $TAG --repo $UPSTREAM --dir dist
-            # 获取版本说明
-            gh release view $TAG --repo $UPSTREAM --json body --template '{{.body}}' > notes.md
-
-            # 4. 在 Gitee 创建 Release
-            # 使用 jq 提取创建成功后的 release ID
-            RESPONSE=$(curl -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
-              -d "access_token=${GITEE_TOKEN}" \
-              -d "tag_name=${TAG}" \
-              -d "name=Karing ${TAG}" \
-              -d "body=$(cat notes.md | head -c 1000)" \
-              -d "target_confirm=master")
-            
-            RELEASE_ID=$(echo $RESPONSE | jq '.id')
-
-            if [ "$RELEASE_ID" = "null" ]; then
-              echo "Failed to create Gitee release. Response: $RESPONSE"
-              exit 1
-            fi
-
-            # 5. 上传附件到 Gitee
-            for file in ./dist/*; do
-              filename=$(basename "$file")
-              echo "Uploading $filename to Gitee..."
-              curl -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-                -F "access_token=${GITEE_TOKEN}" \
-                -F "file=@$file"
-            done
-            
-            echo "Successfully synced $TAG to Gitee."
+          # 4. 在 Gitee 创建 Release 记录
+          # 如果已存在旧的，先删掉重来
+          EXISTING_ID=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq '.id // empty')
+          if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
+             echo "Deleting old release ID: $EXISTING_ID"
+             curl -X DELETE "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${EXISTING_ID}?access_token=${GITEE_TOKEN}"
           fi
+
+          echo "Creating new release on Gitee..."
+          RESPONSE=$(curl -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
+            -d "access_token=${GITEE_TOKEN}&tag_name=${TAG}&name=Karing-${TAG}&body=Synced-from-GitHub&target_confirm=master")
+          
+          RELEASE_ID=$(echo $RESPONSE | jq -r '.id // empty')
+
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "Failed to create Release. Gitee response: $RESPONSE"
+            exit 1
+          fi
+
+          # 5. 上传附件
+          for file in ./dist/*; do
+            filename=$(basename "$file")
+            filesize=$(stat -c%s "$file")
+            if [ $filesize -gt 104857600 ]; then
+              echo "Skipping $filename (Exceeds 100MB)"
+              continue
+            fi
+            echo "Uploading $filename..."
+            curl -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@$file"
+          done
+          echo "Mission Accomplished!"

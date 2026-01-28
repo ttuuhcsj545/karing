@@ -2,8 +2,8 @@ name: Sync Latest Release to Gitee
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天凌晨 2 点检查更新
-  workflow_dispatch:   # 允许手动点击按钮触发
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -12,7 +12,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取所有历史以确保能推送 Tag
+          fetch-depth: 0
 
       - name: Sync Process
         env:
@@ -25,24 +25,28 @@ jobs:
           TAG=$(gh release view --repo $UPSTREAM --json tagName --template '{{.tagName}}')
           echo "Target Tag: $TAG"
 
-          # 2. 同步代码和 Tag 到 Gitee (解决“什么都没有”的问题)
+          # 2. 修正后的 Git 推送逻辑：使用 用户名:Token 格式
           echo "Pushing code and tags to Gitee..."
-          git remote add gitee "https://x-access-token:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
-          # 强制将当前分支推送到 Gitee 的 master
+          GITEE_USER=$(echo ${GITEE_REPO} | cut -d'/' -f1)
+          
+          # 清理旧远程（防止重复运行报错）
+          git remote remove gitee 2>/dev/null || true
+          git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          
+          # 推送代码分支 (GitHub 默认为 main，推送到 Gitee 的 master)
           git push gitee HEAD:master --force
-          # 拉取原厂 Tag 并推送到 Gitee
+          
+          # 获取并推送指定 Tag
           git fetch --tags https://github.com/${UPSTREAM}.git
           git push gitee $TAG --force
 
-          # 3. 下载原仓库附件到本地
+          # 3. 下载附件
           echo "Downloading assets from GitHub..."
           mkdir -p dist
           rm -rf dist/*
           gh release download $TAG --repo $UPSTREAM --dir dist
-          gh release view $TAG --repo $UPSTREAM --json body --template '{{.body}}' > notes.md
-
-          # 4. 在 Gitee 创建 Release 记录
-          # 如果 Gitee 已有该 Tag 的 Release 但没附件，先删除旧记录
+          
+          # 4. 在 Gitee 创建 Release
           EXISTING_ID=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq '.id // empty')
           if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
              echo "Deleting existing release ID: $EXISTING_ID"
@@ -50,14 +54,11 @@ jobs:
           fi
 
           echo "Creating new release on Gitee..."
-          # 截取说明文字防止过长报错
-          CLEAN_BODY=$(cat notes.md | head -c 1000 | tr -d '"' | tr -d '\n' | tr -d '\r')
-          
           RESPONSE=$(curl -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
             -d "access_token=${GITEE_TOKEN}" \
             -d "tag_name=${TAG}" \
             -d "name=Karing-${TAG}" \
-            -d "body=Synced-from-KaringX" \
+            -d "body=Synced-from-GitHub-KaringX" \
             -d "target_confirm=master")
           
           RELEASE_ID=$(echo $RESPONSE | jq -r '.id // empty')
@@ -67,14 +68,13 @@ jobs:
             exit 1
           fi
 
-          # 5. 上传附件到 Gitee (跳过超过 100MB 的文件)
-          echo "Starting file upload to Gitee..."
+          # 5. 上传附件 (跳过 >100MB)
+          echo "Starting file upload..."
           for file in ./dist/*; do
             filename=$(basename "$file")
             filesize=$(stat -c%s "$file")
-            # Gitee 限制 100MB (104857600 字节)
             if [ $filesize -gt 104857600 ]; then
-              echo "!!! Skipping $filename ($((filesize/1024/1024))MB) - File too large for Gitee Free."
+              echo "Skipping $filename ($((filesize/1024/1024))MB) - Too large."
               continue
             fi
             
@@ -84,4 +84,4 @@ jobs:
               -F "file=@$file"
           done
 
-          echo "Sync Complete! Check your Gitee repository releases page."
+          echo "Done! Check your Gitee Releases page."

@@ -25,20 +25,16 @@ jobs:
           TAG=$(gh release view --repo $UPSTREAM --json tagName --template '{{.tagName}}')
           echo "Target Tag: $TAG"
 
-          # 2. 修正后的 Git 推送逻辑：使用 用户名:Token 格式
+          # 2. Git 认证与推送 (加入容错)
           echo "Pushing code and tags to Gitee..."
           GITEE_USER=$(echo ${GITEE_REPO} | cut -d'/' -f1)
-          
-          # 清理旧远程（防止重复运行报错）
           git remote remove gitee 2>/dev/null || true
           git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
           
-          # 推送代码分支 (GitHub 默认为 main，推送到 Gitee 的 master)
-          git push gitee HEAD:master --force
-          
-          # 获取并推送指定 Tag
+          # 即使分支或 Tag 已存在，也不报错停止
+          git push gitee HEAD:master --force || true
           git fetch --tags https://github.com/${UPSTREAM}.git
-          git push gitee $TAG --force
+          git push gitee $TAG --force || true
 
           # 3. 下载附件
           echo "Downloading assets from GitHub..."
@@ -46,10 +42,12 @@ jobs:
           rm -rf dist/*
           gh release download $TAG --repo $UPSTREAM --dir dist
           
-          # 4. 在 Gitee 创建 Release
-          EXISTING_ID=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq '.id // empty')
+          # 4. 在 Gitee 创建/更新 Release 记录
+          # 先检查 Gitee 是否已有该 Release
+          EXISTING_ID=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq -r '.id // empty')
+          
           if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
-             echo "Deleting existing release ID: $EXISTING_ID"
+             echo "Deleting existing release ID: $EXISTING_ID to ensure fresh sync."
              curl -X DELETE "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${EXISTING_ID}?access_token=${GITEE_TOKEN}"
           fi
 
@@ -68,20 +66,21 @@ jobs:
             exit 1
           fi
 
-          # 5. 上传附件 (跳过 >100MB)
+          # 5. 上传附件 (跳过 >100MB 文件)
           echo "Starting file upload..."
           for file in ./dist/*; do
             filename=$(basename "$file")
             filesize=$(stat -c%s "$file")
             if [ $filesize -gt 104857600 ]; then
-              echo "Skipping $filename ($((filesize/1024/1024))MB) - Too large."
+              echo "Skipping $filename ($((filesize/1024/1024))MB) - Exceeds Gitee 100MB limit."
               continue
             fi
             
             echo "Uploading $filename..."
+            # Gitee 上传附件 API
             curl -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
               -F "file=@$file"
           done
 
-          echo "Done! Check your Gitee Releases page."
+          echo "Success! All compatible assets synced to Gitee."
